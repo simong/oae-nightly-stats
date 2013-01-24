@@ -211,10 +211,16 @@ if $START_CLEAN_DB ; then
         shutdownDb 10.112.4.124 db0
         shutdownDb 10.112.4.125 db1
         shutdownDb 10.112.4.126 db2
+        shutdownDb 10.112.7.55 db3
+        shutdownDb 10.112.3.238 db4
+        shutdownDb 10.112.1.251 db5
 
         refreshDb 10.112.4.124
         refreshDb 10.112.4.125
         refreshDb 10.112.4.126
+        refreshDb 10.112.7.55
+        refreshDb 10.112.3.238
+        refreshDb 10.112.1.251
 
 fi
 
