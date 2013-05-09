@@ -13,19 +13,19 @@ START_CLEAN_SEARCH=true
 LOG_DIR=/var/www/`date +"%Y/%m/%d/%H/%M"`
 TEST_LABEL=$1
 
-LOAD_NR_OF_BATCHES=10
-LOAD_NR_OF_CONCURRENT_BATCHES=5
+LOAD_NR_OF_BATCHES=1
+LOAD_NR_OF_CONCURRENT_BATCHES=1
 LOAD_NR_OF_USERS=1000
 LOAD_NR_OF_GROUPS=2000
 LOAD_NR_OF_CONTENT=5000
 
 # Admin host
-ADMIN_HOST='admin.oae-performance.sakaiproject.org'
+ADMIN_HOST='admin.oae-performance.oaeproject.org'
 
 # Tenant host
 TENANT_ALIAS='oae'
 TENANT_NAME='Open Academic Environment'
-TENANT_HOST="${TENANT_ALIAS}.oae-performance.sakaiproject.org"
+TENANT_HOST="${TENANT_ALIAS}.oae-performance.oaeproject.org"
 
 # Circonus configuration
 CIRCONUS_AUTH_TOKEN="46c8c856-5912-4da2-c2b7-a9612d3ba949"
@@ -33,20 +33,6 @@ CIRCONUS_APP_NAME="oae-nightly-run"
 
 PUPPET_REMOTE='sakaiproject'
 PUPPET_BRANCH='master'
-
-APP_REMOTE='sakaiproject'
-APP_BRANCH='master'
-
-UX_REMOTE='sakaiproject'
-UX_BRANCH='Hilary'
-
-# Backend options are: 'local' or 'amazons3'
-STORAGE_BACKEND='local'
-STORAGE_LOCAL_DIR='/shared/files'
-STORAGE_AMAZON_ACCESS_KEY='AKIAJTASR3UIC6GNWFRA'
-STORAGE_AMAZON_SECRET_KEY='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'
-STORAGE_AMAZON_REGION='us-east-1'
-STORAGE_AMAZON_BUCKET='oae-performance-files'
 
 # How long (in seconds) to sleep to let activities generate before wiping out pending activities
 ACTIVITY_SLEEP=120
@@ -58,212 +44,105 @@ prctl -t basic -n process.max-file-descriptor -v 32678 $$
 mkdir -p ${LOG_DIR}
 exec &> "${LOG_DIR}/nightly.txt"
 
-######################
-## HELPER FUNCTIONS ##
-######################
-
-## Refresh the puppet configuration of the server
-function refreshPuppet {
-        # $1 : User
-        # $2 : Host IP
-        # $3 : Node certName (e.g., app0)
-
-        # Delete and re-clone puppet repository
-        ssh -t $1@$2 << EOF
-                rm -Rf puppet-hilary;
-                git clone http://github.com/${PUPPET_REMOTE}/puppet-hilary;
-                cd puppet-hilary;
-                echo "$3" > .node;
-                echo performance > .environment;
-                git checkout ${PUPPET_BRANCH};
-                bin/pull.sh;
+## Refresh the puppet configuration on the puppetmaster
+# Delete and re-clone puppet repository
+ssh -t $1@$2 << EOF
+    rm -rf puppet-hilary;
+    git clone http://github.com/${PUPPET_REMOTE}/puppet-hilary;
+    cd puppet-hilary;
+    git checkout ${PUPPET_BRANCH};
+    bin/pull.sh;
 EOF
 
+####################
+# Helper functions #
+####################
+
+function destroyEnvironment {
+    # Copy all the server logs and zip them up
+    mkdir "${LOG_DIR}/serverlogs"
+    scp -r root@$sakaigerperformance_syslog:/var/log/rsyslog "${LOG_DIR}/serverlogs"
+    tar -cvzf "${LOG_DIR}/serverlogs.tar.gz" "${LOG_DIR}/serverlogs"
+    rm -rf "${LOG_DIR}/serverlogs"
+
+    # Destroy all the machines
+    node slapchop.js --environment env-performance --datacenter eu-ams-1 --account sakaiger --destroy y -f ! puppet destroy
 }
+trap destroyEnvironment EXIT
 
-## Delete and refresh the app server
-function refreshApp {
-        # $1 : Host IP
-        # $2 : Node certName (e.g., app0)
+# Create all the nodes.
+# In case the nodes were already running, this won't do much.
+cd /root/slapchop
+node slapchop.js --environment env-performance --datacenter eu-ams-1 --account sakaiger --create y bootstrap
 
-        refreshPuppet admin $1 $2
+# Get all the nodes as environment variables.
+# ex: this makes app0 available with $sakaigerperformance_app0
+node slapchop.js --environment env-performance --datacenter eu-ams-1 --account sakaiger create-provision-script | tail -n +2 foo | head -n -1 | bash
 
-        # switch the branch to the desired one in the init.pp script
-        ssh -t admin@$1 << EOF
-                sudo chown -R admin ~/puppet-hilary
-                sed -i '' "s/\\\$app_git_user .*/\\\$app_git_user = '$APP_REMOTE'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$app_git_branch .*/\\\$app_git_branch = '$APP_BRANCH'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$ux_git_user .*/\\\$ux_git_user = '$UX_REMOTE'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$ux_git_branch .*/\\\$ux_git_branch = '$UX_BRANCH'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                rm -rf ${STORAGE_LOCAL_DIR}/*;
-EOF
-        # refresh the OAE application now
-        ssh -t admin@$1 ". ~/.profile && /home/admin/puppet-hilary/clean-scripts/appnode.sh"
-}
+# Create the provisioning script.
+# Add the wait commando to the provision script.
+# This means we'll only return when all the SSH commands have run.
+node slapchop.js --environment env-performance --datacenter eu-ams-1 --account sakaiger create-provision-script | tail -n +2 foo | head -n -1 > /tmp/provision-script.sh
+echo "\nwait" >> /tmp/provision-script.sh
 
-function refreshActivity {
-    # $1 : Host IP
-    # $2 : Node certName (e.g., activity0)
+# By executing it, we'll setup the puppet agent and mcollective on each node.
+# In case the nodes were already running, this will just execute some apt-get update statements which is pretty harmless
+chmod u+x /tmp/provision-script.sh
+/tmp/provision-script.sh
 
-    refreshApp $1 $2
-}
+# All nodes have puppet and MCO, reboot everything except for puppetmaster.
+# SlapChop will take care of waiting till every node is back up.
+node slapchop.js --environment env-performance --datacenter eu-ams-1 --account sakaiger -f ! puppet reboot
 
-function refreshWeb {
-        # $1 : Host IP
-        # $2 : Node Cert Name (e.g., web0)
+# Sleep 30 seconds so that each node has the time to make itself known to the puppetmaster
+# and the puppetmaster can sign the certificates.
+sleep 30
 
-        refreshPuppet admin $1 $2
+# Each node will try to pull down the latest catalog.
+# Wait till all nodes have it.
+nodes_applying=1
+attempts=0
+while [ $nodes_applying -gt 0 ] ; do
+    nodes_applying=$(mco puppet status | grep 'Currently applying a catalog;' | wc -l)
 
-        # switch the branch to the desired one in the init.pp script
-        ssh -t admin@$1 << EOF
-                sudo chown -R admin ~/puppet-hilary
-                sed -i '' "s/\\\$ux_git_user .*/\\\$ux_git_user = '$UX_REMOTE'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$ux_git_branch .*/\\\$ux_git_branch = '$UX_BRANCH'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-EOF
-        ssh -t admin@$1 ". ~/.profile && /home/admin/puppet-hilary/clean-scripts/webclean.sh" 
-}
+    # Don't poll forever..
+    attempts=$(($attempts + 1))
+    if [ $attempts -eq 60 ] ; then
+        echo "Some nodes took longer then 10 minutes to apply their catalog."
+        echo "That doesn't seem right. Aborting performance run."
 
-## Shut down the DB node
-function shutdownDb {
-        # $1 : Host IP
-        # $2 : Node certName (e.g., app0)
+        # Do another puppet status to show which ones.
+        mco puppet status
+        exit 1
+    fi
 
-        refreshPuppet root $1 $2
-        ssh -t root@$1 /root/puppet-hilary/clean-scripts/dbshutdown.sh
-}
+    # Sleep for 10 seconds before polling again.
+    sleep 10
+done
 
-## Refresh the DB node
-function refreshDb {
-        # $1 : Host IP
+# If we get to this point, that means all nodes have installed all their services.
+# Restart the services in the right order and we should have an up-and-running environment.
+mco service -W '::oaeservice::cassandra' cassandra restart
+mco service -W '::oaeservice::redis' redis restart
+mco service -W '::oaeservice::elasticsearch' elasticsearch restart
+mco service -W '::oaeservice::rabbitmq-server' rabbitmq-server restart
 
-        ssh -t root@$1 /root/puppet-hilary/clean-scripts/dbclean.sh
-}
+# Give the dependencies some time to bootstrap themselves before connecting.
+sleep 10
+mco service -W '::oaeservice::hilary' hilary restart
 
-## Refresh the Redis node
-function refreshRedis {
-        # $1 : Host IP
-        # $2 : Cert Name (e.g., db0)
-
-        refreshPuppet admin $1 $2
-        ssh -t admin@$1 puppet-hilary/clean-scripts/cacheclean.sh
-}
-
-function refreshSearch {
-        # $1 : Host IP
-        # $2 : Cert Name (e.g., search0)
-
-        refreshPuppet root $1 $2
-        ssh -t root@$1 << EOF
-                cd ~/puppet-hilary
-                bin/apply.sh
-EOF
-
-}
-
-function refreshMq {
-        # $1 : Host IP
-        # $2 : Cert Name (e.g., mq0)
-        
-        refreshPuppet root $1 $2
-        ssh -t root@$1 << EOF
-                cd ~/puppet-hilary
-                bin/apply.sh
-EOF
-
-}
-
-## Refresh the Preview processor node.
-function refreshPreviewProcessor {
-        # $1 : Host IP
-        # $2 : Cert Name (e.g., db0)
-
-        refreshPuppet root $1 $2
-
-        # switch the branch to the desired one in the init.pp script
-        ssh -t root@$1 << EOF
-                sed -i '' "s/\\\$app_git_user .*/\\\$app_git_user = '$APP_REMOTE'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$app_git_branch .*/\\\$app_git_branch = '$APP_BRANCH'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$ux_git_user .*/\\\$ux_git_user = '$UX_REMOTE'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-                sed -i '' "s/\\\$ux_git_branch .*/\\\$ux_git_branch = '$UX_BRANCH'/g" ~/puppet-hilary/environments/performance/modules/localconfig/manifests/init.pp;
-EOF
-        ssh -t root@$1 ". ~/.profile && /root/puppet-hilary/clean-scripts/ppnode.sh"
-}
+# Give the Hilary servers some time to bootstrap themselves before running nginx.
+# Nginx seems to start faster if it can immediately connect to an upstream server
+sleep 10
+mco service -W '::oaeservice::nginx' hilary restart
 
 
-###############
-## EXECUTION ##
-###############
-
-# Clean up the performance environment.
-# This involves ssh'ing into each machine and running the respective
-# clean scripts.
-
-if $START_CLEAN_SEARCH ; then
-        echo 'Cleaning the search data...'
-
-        refreshSearch 10.112.4.222 search0
-        refreshSearch 10.112.6.159 search1
-
-        # Ensure there is a search server available with which to delete the oae index
-        sleep 10
-
-        # destroy the oae search index
-        curl -XDELETE http://10.112.4.222:9200/oae
-fi
-
-if $START_CLEAN_DB ; then
-        echo 'Cleaning the DB servers...'
-
-        # Clean the db nodes first.
-        # Stop the entire cassandra cluster
-
-        # Run this first so we don't run the risk that the 2 other nodes start distributing data of the first node
-        shutdownDb 10.112.2.44 db0
-        shutdownDb 10.112.7.44 db1
-        shutdownDb 10.112.7.215 db2
-
-        refreshDb 10.112.2.44
-        refreshDb 10.112.7.44
-        refreshDb 10.112.7.215
-
-fi
-
-if $START_CLEAN_APP ; then
-        echo 'Cleaning the APP servers...'
-
-        # Refresh the first app server and give time for bootstrapping cassandra, search etc...
-        refreshApp 10.112.4.121 app0
-        sleep 10
-
-        refreshApp 10.112.4.122 app1
-        refreshApp 10.112.5.18 app2
-        refreshApp 10.112.4.244 app3
-
-        refreshActivity 10.112.6.85 activity0
-        refreshActivity 10.112.5.198 activity1
-        refreshActivity 10.112.3.29 activity2
-
-        # Sleep a bit so nginx can catch up
-        sleep 10
-
-        #refreshPreviewProcessor 10.112.6.119 pp0
-fi
-
-if $START_CLEAN_WEB ; then
-        echo 'Cleaning the web server...'
-
-        refreshWeb 10.112.4.123 web0
-fi
-
-refreshMq 10.112.5.189 mq0
 
 # Do a fake request to nginx to poke the balancers
 curl -e "/" http://${ADMIN_HOST}
-curl -e "/" http://${TENANT_HOST}
 
 # Flush redis.
-refreshRedis 10.112.2.103 cache0
-refreshRedis 10.112.7.97 activity-cache
+ssh -t root@$sakaigerperformance_cache0 redis-cli flushall
 
 # Get an admin session to play with.
 ADMIN_COOKIE=$(curl -s -e "/" --cookie-jar - -d"username=administrator" -d"password=administrator" http://${ADMIN_HOST}/api/auth/login | grep connect.sid | cut -f 7)
@@ -275,13 +154,10 @@ curl -e "/" --cookie connect.sid=${ADMIN_COOKIE} -d"alias=${TENANT_ALIAS}" -d"na
 # Turn reCaptcha checking off.
 curl -e "/" --cookie connect.sid=${ADMIN_COOKIE} -d"oae-principals/recaptcha/enabled=false" http://${ADMIN_HOST}/api/config
 
+# Configure the file storage.
 curl -e "/" --cookie connect.sid=${ADMIN_COOKIE} \
-    -d"oae-content/storage/backend=${STORAGE_BACKEND}" \
-    -d"oae-content/storage/local-dir=${STORAGE_LOCAL_DIR}" \
-    -d"oae-content/storage/amazons3-access-key=${STORAGE_AMAZON_ACCESS_KEY}" \
-    -d"oae-content/storage/amazons3-secret-key=${STORAGE_AMAZON_SECRET_KEY}" \
-    -d"oae-content/storage/amazons3-region=${STORAGE_AMAZON_REGION}" \
-    -d"oae-content/storage/amazons3-bucket=${STORAGE_AMAZON_BUCKET}" http://${ADMIN_HOST}/api/config
+    -d"oae-content/storage/backend=local" \
+    -d"oae-content/storage/local-dir=/shared/files" http://${ADMIN_HOST}/api/config
 
 
 
@@ -333,11 +209,11 @@ echo "Sleeping ${ACTIVITY_SLEEP} seconds before clearing activity cache"
 sleep $ACTIVITY_SLEEP
 
 # Clean out all pending activities before the performance test
-ssh -t admin@10.112.7.97 redis-cli flushall
+ssh -t root@$sakaigerperformance_cache0 redis-cli flushall
 
 
 # Capture some graphs.
-ssh -n -f admin@10.112.4.121 ". ~/.profile && nohup sh -c /home/admin/flamegraphs.sh > /dev/null 2>&1 &"
+ssh -n -f root@$sakaigerperformance_app0 ". ~/.profile && nohup sh -c /home/admin/flamegraphs.sh > /dev/null 2>&1 &"
 
 # Run the tsung tests.
 START=`date +%s`
@@ -356,7 +232,7 @@ echo "Tsung suite ended at " `date`
 
 
 # Copy over the graphs.
-scp -r admin@10.112.4.121:/home/admin/graphs ${LOG_DIR}
+scp -r root@$sakaigerperformance_app0:/home/admin/graphs ${LOG_DIR}
 
 # Generate some simple stats.
 cd ~/oae-nightly-stats
